@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [2.5.0] – 2025
+## [2.6.0] – 2025
 
 ### Added
 - **Web upload** – upload HEIC/JPG/PNG photos directly from the browser (including iPhone Safari). Sequential upload with per-file progress indicator (`Uploading 3 / 12: photo.heic`).
