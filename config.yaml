@@ -1,5 +1,5 @@
 name: "SnapFrame – HEIC Photo Slideshow for Home Assistant"
-version: "2.5.0"
+version: "2.6.0"
 slug: "snapframe"
 description: "Converts HEIC photos from iPhone via SMB share and serves a fullscreen slideshow optimised for iPad/Safari. Features: albums, EXIF date/GPS overlay, swipe gestures, web upload, auto-scan."
 url: "https://github.com/EMO/ha-snapframe"
@@ -26,6 +26,9 @@ options:
   web_port: 8099
   basic_auth_user: ""
   basic_auth_password: ""
+  language: "sk"
+  sleep_start: ""
+  sleep_end: ""
 schema:
   smb_server: str
   smb_share: str
@@ -42,6 +45,9 @@ schema:
   web_port: port
   basic_auth_user: str
   basic_auth_password: password
+  language: str
+  sleep_start: str
+  sleep_end: str
 ports:
   8099/tcp: 8099
 ports_description:
