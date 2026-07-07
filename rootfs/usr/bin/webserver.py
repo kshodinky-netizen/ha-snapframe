@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-Fotorámik webový server v2.5.
-Novinky v2.5: web upload, /status, /scan trigger, LRU EXIF cache,
-persistentná geocoding cache, thumbnail kvalita z config,
-konfigurovateľná veľkosť thumbnail, počítadlo fotiek, albumové covery,
-základná autentifikácia (voliteľná), oprava refresh timera.
-Kompatibilné so Safari 9 / iOS 9.
+SnapFrame – webový server v2.6
+Novinky v2.6: multi-language (SK/EN/DE), sleep schedule (čierna obrazovka v noci)
 """
 
 import os
@@ -23,11 +19,10 @@ from flask import Flask, send_from_directory, jsonify, Response, request
 from PIL import Image, ImageOps
 from PIL.ExifTags import TAGS
 
-log = logging.getLogger("ha-snapframe.web")
+log = logging.getLogger("snapframe.web")
 
-OUTPUT_FOLDER      = os.environ.get("OUTPUT_FOLDER",  "/sambamount/converted")
-SLIDESHOW_SECONDS  = int(os.environ.get("SLIDESHOW_SECONDS", "30"))
-WEB_PORT           = int(os.environ.get("WEB_PORT",  "8099"))
+# ── Config ────────────────────────────────────────────────────────────────────
+
 def _env_int(key, default):
     try:
         return int(os.environ.get(key, ""))
@@ -38,27 +33,31 @@ def _env_str(key, default=""):
     v = os.environ.get(key, "")
     return default if v in ("null", "", None) else v
 
+OUTPUT_FOLDER   = _env_str("OUTPUT_FOLDER",  "/sambamount/converted")
+SLIDESHOW_SECS  = _env_int("SLIDESHOW_SECONDS", 30)
+WEB_PORT        = _env_int("WEB_PORT",  8099)
 JPG_QUALITY     = _env_int("JPG_QUALITY",    92)
 THUMB_QUALITY   = _env_int("THUMB_QUALITY",  82)
 THUMB_MAX_PX    = _env_int("THUMB_MAX_PX",   1024)
 BASIC_AUTH_USER = _env_str("BASIC_AUTH_USER")
 BASIC_AUTH_PASS = _env_str("BASIC_AUTH_PASSWORD")
+LANGUAGE        = _env_str("LANGUAGE", "sk")          # sk | en | de
+SLEEP_START     = _env_str("SLEEP_START", "")         # "23:00" alebo ""
+SLEEP_END       = _env_str("SLEEP_END",   "")         # "07:00" alebo ""
 
 GEOCACHE_FILE = "/data/geocode_cache.json"
+ALLOWED_EXT   = (".jpg", ".jpeg", ".png")
 
 app = Flask(__name__)
 
-ALLOWED_EXT = (".jpg", ".jpeg", ".png")
-
-# ── Zdieľaný stav (voliteľný – funguje aj bez state.py) ──────────────────────
+# ── Zdieľaný stav ─────────────────────────────────────────────────────────────
 try:
     import state as _state
     _has_state = True
 except ImportError:
     _has_state = False
 
-# ── LRU Cache pre EXIF (250 položiek) ────────────────────────────────────────
-
+# ── LRU Cache (250 položiek) ──────────────────────────────────────────────────
 class _LRUCache:
     def __init__(self, maxsize=250):
         self._cache   = OrderedDict()
@@ -80,48 +79,141 @@ class _LRUCache:
     def __contains__(self, key):
         return key in self._cache
 
-
 _exif_cache    = _LRUCache(maxsize=250)
-_geocode_cache = {}   # {(lat_round, lon_round): "Miesto, Krajina"}
+_geocode_cache = {}
 
-MONTHS_SK = [
-    "januára", "februára", "marca", "apríla", "mája", "júna",
-    "júla", "augusta", "septembra", "októbra", "novembra", "decembra"
-]
-MONTHS_SK_NOM = [
-    "január", "február", "marec", "apríl", "máj", "jún",
-    "júl", "august", "september", "október", "november", "december"
-]
-COUNTRY_CODE_SK = {
-    "SK": "Slovensko",  "CZ": "Česko",       "HU": "Maďarsko",
-    "PL": "Poľsko",     "AT": "Rakúsko",      "DE": "Nemecko",
-    "IT": "Taliansko",  "FR": "Francúzsko",   "ES": "Španielsko",
-    "PT": "Portugalsko","GR": "Grécko",        "HR": "Chorvátsko",
-    "SI": "Slovinsko",  "RS": "Srbsko",        "BA": "Bosna a Hercegovina",
-    "ME": "Čierna Hora","MK": "Severné Macedónsko","AL": "Albánsko",
-    "RO": "Rumunsko",   "BG": "Bulharsko",     "TR": "Turecko",
-    "CH": "Švajčiarsko","NL": "Holandsko",     "BE": "Belgicko",
-    "LU": "Luxembursko","DK": "Dánsko",        "SE": "Švédsko",
-    "NO": "Nórsko",     "FI": "Fínsko",        "IE": "Írsko",
-    "GB": "Spojené kráľovstvo",                "IS": "Island",
-    "MT": "Malta",      "CY": "Cyprus",        "AD": "Andorra",
-    "MC": "Monako",     "SM": "San Maríno",    "LI": "Lichtenštajnsko",
-    "UA": "Ukrajina",   "BY": "Bielorusko",    "RU": "Rusko",
-    "MD": "Moldavsko",  "GE": "Gruzínsko",     "AM": "Arménsko",
-    "AZ": "Azerbajdžan","LT": "Litva",         "LV": "Lotyšsko",
-    "EE": "Estónsko",
-    "US": "Spojené štáty","CA": "Kanada",      "MX": "Mexiko",
-    "BR": "Brazília",   "AR": "Argentína",     "CL": "Čile",
-    "CO": "Kolumbia",   "PE": "Peru",          "CU": "Kuba",
-    "MA": "Maroko",     "DZ": "Alžírsko",      "TN": "Tunisko",
-    "EG": "Egypt",      "ZA": "Južná Afrika",  "KE": "Keňa",
-    "IL": "Izrael",     "AE": "Spojené arabské emiráty",
-    "TH": "Thajsko",    "VN": "Vietnam",       "JP": "Japonsko",
-    "CN": "Čína",       "IN": "India",         "ID": "Indonézia",
-    "PH": "Filipíny",   "AU": "Austrália",
+# ── Preklady ──────────────────────────────────────────────────────────────────
+TRANSLATIONS = {
+    "sk": {
+        "app_title":            "Fotorámik",
+        "app_subtitle":         "FOTO RÁMIK",
+        "scan_btn":             "\u21bb Skenuj teraz",
+        "scan_started":         "\u2713 Spusten\u00e9",
+        "order_label":          "Poradie fotiek",
+        "order_date":           "Chronologicky",
+        "order_random":         "N\u00e1hodne",
+        "all_photos":           "V\u0161etko",
+        "loading_albums":       "Na\u010d\u00edt\u00e1vam albumy\u2026",
+        "no_albums":            "\u017diadne albumy (podprie\u010dinky)",
+        "upload_toggle":        "\u2191 Nahr\u00e1\u0165 fotky",
+        "upload_album_label":   "Cie\u013eov\u00fd album",
+        "upload_root":          "Kore\u0148ov\u00fd prie\u010dinok",
+        "upload_new_option":    "\u2014 Nov\u00fd album\u2026 \u2014",
+        "upload_new_ph":        "N\u00e1zov nov\u00e9ho albumu",
+        "upload_files_label":   "S\u00fabory (HEIC, JPG, PNG)",
+        "upload_select":        "Vybra\u0165 s\u00fabory\u2026",
+        "upload_selected":      "{0} s\u00fabor(y) vybrat\u00fd(ch)",
+        "upload_go":            "Nahr\u00e1\u0165",
+        "upload_err_files":     "Najprv vyber s\u00fabory.",
+        "upload_err_name":      "Zadaj n\u00e1zov nov\u00e9ho albumu.",
+        "upload_progress":      "Nahr\u00e1vam {0} / {1}: {2}",
+        "upload_done":          "\u2713 {0} fotiek nahrat\u00fdch",
+        "upload_errors":        "({0} ch\u00fdb)",
+        "delete_title":         "Odstr\u00e1ni\u0165 t\u00fato fotku?",
+        "delete_sub":           "Fotka bude presunut\u00e1 do ko\u0161a",
+        "delete_yes":           "Odstr\u00e1ni\u0165",
+        "delete_no":            "Zru\u0161i\u0165",
+        "no_photos":            "\u017diadne fotky v tomto albume",
+    },
+    "en": {
+        "app_title":            "SnapFrame",
+        "app_subtitle":         "PHOTO FRAME",
+        "scan_btn":             "\u21bb Scan now",
+        "scan_started":         "\u2713 Started",
+        "order_label":          "Photo order",
+        "order_date":           "Chronological",
+        "order_random":         "Random",
+        "all_photos":           "All photos",
+        "loading_albums":       "Loading albums\u2026",
+        "no_albums":            "No albums (subfolders)",
+        "upload_toggle":        "\u2191 Upload photos",
+        "upload_album_label":   "Target album",
+        "upload_root":          "Root folder",
+        "upload_new_option":    "\u2014 New album\u2026 \u2014",
+        "upload_new_ph":        "New album name",
+        "upload_files_label":   "Files (HEIC, JPG, PNG)",
+        "upload_select":        "Select files\u2026",
+        "upload_selected":      "{0} file(s) selected",
+        "upload_go":            "Upload",
+        "upload_err_files":     "Please select files first.",
+        "upload_err_name":      "Please enter an album name.",
+        "upload_progress":      "Uploading {0} / {1}: {2}",
+        "upload_done":          "\u2713 {0} photos uploaded",
+        "upload_errors":        "({0} errors)",
+        "delete_title":         "Remove this photo?",
+        "delete_sub":           "Photo will be moved to trash",
+        "delete_yes":           "Remove",
+        "delete_no":            "Cancel",
+        "no_photos":            "No photos in this album",
+    },
+    "de": {
+        "app_title":            "SnapFrame",
+        "app_subtitle":         "FOTO RAHMEN",
+        "scan_btn":             "\u21bb Jetzt scannen",
+        "scan_started":         "\u2713 Gestartet",
+        "order_label":          "Reihenfolge",
+        "order_date":           "Chronologisch",
+        "order_random":         "Zuf\u00e4llig",
+        "all_photos":           "Alle Fotos",
+        "loading_albums":       "Alben werden geladen\u2026",
+        "no_albums":            "Keine Alben (Unterordner)",
+        "upload_toggle":        "\u2191 Fotos hochladen",
+        "upload_album_label":   "Zielalbum",
+        "upload_root":          "Stammordner",
+        "upload_new_option":    "\u2014 Neues Album\u2026 \u2014",
+        "upload_new_ph":        "Name des neuen Albums",
+        "upload_files_label":   "Dateien (HEIC, JPG, PNG)",
+        "upload_select":        "Dateien ausw\u00e4hlen\u2026",
+        "upload_selected":      "{0} Datei(en) ausgew\u00e4hlt",
+        "upload_go":            "Hochladen",
+        "upload_err_files":     "Bitte zuerst Dateien ausw\u00e4hlen.",
+        "upload_err_name":      "Bitte Albumname eingeben.",
+        "upload_progress":      "Lade hoch {0} / {1}: {2}",
+        "upload_done":          "\u2713 {0} Fotos hochgeladen",
+        "upload_errors":        "({0} Fehler)",
+        "delete_title":         "Dieses Foto entfernen?",
+        "delete_sub":           "Foto wird in den Papierkorb verschoben",
+        "delete_yes":           "Entfernen",
+        "delete_no":            "Abbrechen",
+        "no_photos":            "Keine Fotos in diesem Album",
+    },
 }
 
-# ── Geocoding cache – persistencia ───────────────────────────────────────────
+MONTHS = {
+    "sk": ["január","február","marec","apríl","máj","jún",
+           "júl","august","september","október","november","december"],
+    "en": ["January","February","March","April","May","June",
+           "July","August","September","October","November","December"],
+    "de": ["Januar","Februar","März","April","Mai","Juni",
+           "Juli","August","September","Oktober","November","Dezember"],
+}
+
+GEOCODE_LANG = {"sk": "sk,cs,en", "en": "en", "de": "de,en"}
+
+COUNTRY_CODE_SK = {
+    "SK":"Slovensko","CZ":"Česko","HU":"Maďarsko","PL":"Poľsko",
+    "AT":"Rakúsko","DE":"Nemecko","IT":"Taliansko","FR":"Francúzsko",
+    "ES":"Španielsko","PT":"Portugalsko","GR":"Grécko","HR":"Chorvátsko",
+    "SI":"Slovinsko","RS":"Srbsko","BA":"Bosna a Hercegovina",
+    "ME":"Čierna Hora","MK":"Severné Macedónsko","AL":"Albánsko",
+    "RO":"Rumunsko","BG":"Bulharsko","TR":"Turecko","CH":"Švajčiarsko",
+    "NL":"Holandsko","BE":"Belgicko","LU":"Luxembursko","DK":"Dánsko",
+    "SE":"Švédsko","NO":"Nórsko","FI":"Fínsko","IE":"Írsko",
+    "GB":"Spojené kráľovstvo","IS":"Island","MT":"Malta","CY":"Cyprus",
+    "AD":"Andorra","MC":"Monako","SM":"San Maríno","LI":"Lichtenštajnsko",
+    "UA":"Ukrajina","BY":"Bielorusko","RU":"Rusko","MD":"Moldavsko",
+    "GE":"Gruzínsko","AM":"Arménsko","AZ":"Azerbajdžan",
+    "LT":"Litva","LV":"Lotyšsko","EE":"Estónsko",
+    "US":"Spojené štáty","CA":"Kanada","MX":"Mexiko","BR":"Brazília",
+    "AR":"Argentína","CL":"Čile","CO":"Kolumbia","PE":"Peru","CU":"Kuba",
+    "MA":"Maroko","DZ":"Alžírsko","TN":"Tunisko","EG":"Egypt",
+    "ZA":"Južná Afrika","KE":"Keňa","IL":"Izrael",
+    "AE":"Spojené arabské emiráty","TH":"Thajsko","VN":"Vietnam",
+    "JP":"Japonsko","CN":"Čína","IN":"India","ID":"Indonézia",
+    "PH":"Filipíny","AU":"Austrália",
+}
+
+# ── Geocoding cache ───────────────────────────────────────────────────────────
 
 def _load_geocode_cache():
     global _geocode_cache
@@ -130,18 +222,17 @@ def _load_geocode_cache():
             raw = json_module.load(f)
         for k, v in raw.items():
             parts = k.split(",")
-            if len(parts) == 2:
-                _geocode_cache[(float(parts[0]), float(parts[1]))] = v
+            if len(parts) == 3:
+                _geocode_cache[(float(parts[0]), float(parts[1]), parts[2])] = v
         log.info("Geocache: načítaných {} lokácií".format(len(_geocode_cache)))
     except FileNotFoundError:
         pass
     except Exception as e:
         log.warning("Geocache načítanie zlyhalo: {}".format(e))
 
-
 def _save_geocode_cache():
     try:
-        raw = {"{},{}".format(k[0], k[1]): v for k, v in _geocode_cache.items()}
+        raw = {"{},{},{}".format(k[0], k[1], k[2]): v for k, v in _geocode_cache.items()}
         with open(GEOCACHE_FILE, "w", encoding="utf-8") as f:
             json_module.dump(raw, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -154,14 +245,11 @@ def _load_exif(path: Path):
         mtime = path.stat().st_mtime
     except OSError:
         return {}
-
     cache_key = (str(path), mtime)
     cached = _exif_cache.get(cache_key)
     if cached is not None:
         return cached
-
     result = {"date": None, "gps": None}
-
     try:
         img  = Image.open(path)
         exif = img.getexif()
@@ -176,62 +264,52 @@ def _load_exif(path: Path):
                         pass
             gps_ifd = exif.get_ifd(0x8825)
             if gps_ifd:
-                lat_ref = gps_ifd.get(1)
-                lat     = gps_ifd.get(2)
-                lon_ref = gps_ifd.get(3)
-                lon     = gps_ifd.get(4)
+                lat_ref = gps_ifd.get(1); lat = gps_ifd.get(2)
+                lon_ref = gps_ifd.get(3); lon = gps_ifd.get(4)
                 if all([lat_ref, lat, lon_ref, lon]):
                     def to_deg(val):
                         d, m, s = val
                         return float(d) + float(m) / 60.0 + float(s) / 3600.0
-                    lat_deg = to_deg(lat)
-                    lon_deg = to_deg(lon)
+                    lat_deg = to_deg(lat); lon_deg = to_deg(lon)
                     if lat_ref == "S": lat_deg = -lat_deg
                     if lon_ref == "W": lon_deg = -lon_deg
                     result["gps"] = (lat_deg, lon_deg)
     except Exception as e:
         log.debug("EXIF chyba {}: {}".format(path.name, e))
-
     _exif_cache.set(cache_key, result)
     return result
-
 
 def get_exif_date(path: Path):
     return _load_exif(path).get("date")
 
-
 def get_gps_coords(path: Path):
     return _load_exif(path).get("gps")
 
-
-def reverse_geocode(lat, lon):
-    key = (round(lat, 2), round(lon, 2))
+def reverse_geocode(lat, lon, lang):
+    key = (round(lat, 2), round(lon, 2), lang)
     if key in _geocode_cache:
         return _geocode_cache[key]
-
     result = ""
     try:
+        accept_lang = GEOCODE_LANG.get(lang, "en")
         url = (
             "https://nominatim.openstreetmap.org/reverse"
-            "?format=json&lat={}&lon={}&zoom=10&accept-language=sk,cs,en".format(lat, lon)
+            "?format=json&lat={}&lon={}&zoom=10&accept-language={}".format(lat, lon, accept_lang)
         )
-        req = urllib.request.Request(url, headers={"User-Agent": "SnapFrame/2.5"})
+        req = urllib.request.Request(url, headers={"User-Agent": "SnapFrame/2.6"})
         with urllib.request.urlopen(req, timeout=6) as resp:
             data = json_module.loads(resp.read().decode("utf-8"))
         address = data.get("address", {})
-        place   = (
-            address.get("city") or address.get("town") or
-            address.get("village") or address.get("county") or ""
-        )
-        cc      = address.get("country_code", "").upper()
-        country = COUNTRY_CODE_SK.get(cc, address.get("country", ""))
-        if place and country:
-            result = "{}, {}".format(place, country)
+        place   = (address.get("city") or address.get("town") or
+                   address.get("village") or address.get("county") or "")
+        if lang == "sk":
+            cc      = address.get("country_code", "").upper()
+            country = COUNTRY_CODE_SK.get(cc, address.get("country", ""))
         else:
-            result = place or country or ""
+            country = address.get("country", "")
+        result = "{}, {}".format(place, country) if place and country else (place or country or "")
     except Exception as e:
         log.debug("Geocoding chyba ({}, {}): {}".format(lat, lon, e))
-
     _geocode_cache[key] = result
     _save_geocode_cache()
     return result
@@ -239,7 +317,6 @@ def reverse_geocode(lat, lon):
 # ── Foto helpers ──────────────────────────────────────────────────────────────
 
 def list_albums():
-    """Vráti abecedne zoradený zoznam albumov s počtom fotiek."""
     folder = Path(OUTPUT_FOLDER)
     if not folder.exists():
         return []
@@ -247,19 +324,15 @@ def list_albums():
     result = []
     for d in sorted(folder.iterdir()):
         if d.is_dir() and d.name not in HIDDEN:
-            count = sum(
-                1 for f in d.iterdir()
-                if f.is_file() and f.suffix.lower() in ALLOWED_EXT
-            )
+            count = sum(1 for f in d.iterdir()
+                        if f.is_file() and f.suffix.lower() in ALLOWED_EXT)
             result.append({"name": d.name, "count": count})
     return result
-
 
 def list_photos(album=""):
     folder = Path(OUTPUT_FOLDER)
     if not folder.exists():
         return []
-
     if album and album != "all":
         search = folder / album
         if not search.is_dir():
@@ -271,18 +344,15 @@ def list_photos(album=""):
         files  = [f for f in folder.rglob("*")
                   if f.is_file() and f.suffix.lower() in ALLOWED_EXT
                   and not any(p in HIDDEN for p in f.relative_to(folder).parts)]
-
     def sort_key(f):
         d = get_exif_date(f)
         return d.timestamp() if d is not None else f.stat().st_mtime
-
     files.sort(key=sort_key)
     return [str(f.relative_to(folder)) for f in files]
 
 # ── Thumbnail helper ──────────────────────────────────────────────────────────
 
 def _get_or_create_thumb(filename: str):
-    """Vráti (directory, name) pre send_from_directory, alebo None pri chybe."""
     src        = Path(OUTPUT_FOLDER) / filename
     if not src.is_file():
         return None
@@ -300,7 +370,6 @@ def _get_or_create_thumb(filename: str):
         if img.mode != "RGB":
             img = img.convert("RGB")
         img.save(thumb_path, "JPEG", quality=THUMB_QUALITY, optimize=True)
-        log.debug("Thumbnail vytvorený: {}".format(filename))
     except Exception as e:
         log.warning("Thumbnail chyba {}: {}".format(filename, e))
         if src.is_file():
@@ -313,32 +382,24 @@ def _get_or_create_thumb(filename: str):
 @app.before_request
 def check_auth():
     if not BASIC_AUTH_USER:
-        return   # auth vypnutá
+        return
     auth = request.authorization
     if not auth or auth.username != BASIC_AUTH_USER or auth.password != BASIC_AUTH_PASS:
-        return Response(
-            "Prístup zamietnutý",
-            401,
-            {"WWW-Authenticate": 'Basic realm="Fotorámik"'},
-        )
+        return Response("Unauthorized", 401,
+                        {"WWW-Authenticate": 'Basic realm="SnapFrame"'})
 
-# ── Upload helper ─────────────────────────────────────────────────────────────
+# ── Upload helpers ────────────────────────────────────────────────────────────
 
 def _safe_filename(name: str) -> str:
     name = Path(name).name
     name = re.sub(r"[^\w\-_.()\s]", "_", name, flags=re.UNICODE)
     return name.strip() or "upload"
 
-
 def _format_duration(seconds: int) -> str:
-    if seconds < 60:
-        return "{} sekúnd".format(seconds)
-    elif seconds < 3600:
-        return "{} minút".format(seconds // 60)
-    elif seconds < 86400:
-        return "{:.1f} hodín".format(seconds / 3600)
-    else:
-        return "{:.1f} dní".format(seconds / 86400)
+    if seconds < 60:   return "{} s".format(seconds)
+    if seconds < 3600: return "{} min".format(seconds // 60)
+    if seconds < 86400: return "{:.1f} h".format(seconds / 3600)
+    return "{:.1f} d".format(seconds / 86400)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -346,16 +407,14 @@ def _format_duration(seconds: int) -> str:
 def albums_route():
     return jsonify({"albums": list_albums()})
 
-
 @app.route("/photos")
 def photos_route():
-    album      = request.args.get("album", "")
-    order      = request.args.get("order", "date")
-    photo_list = list_photos(album)
+    album = request.args.get("album", "")
+    order = request.args.get("order", "date")
+    lst   = list_photos(album)
     if order == "random":
-        random_module.shuffle(photo_list)
-    return jsonify({"photos": photo_list})
-
+        random_module.shuffle(lst)
+    return jsonify({"photos": lst})
 
 @app.route("/thumb/<path:filename>")
 def thumb(filename):
@@ -364,10 +423,8 @@ def thumb(filename):
         return ("not found", 404)
     return send_from_directory(result[0], result[1])
 
-
 @app.route("/album-cover/<path:album>")
 def album_cover(album):
-    """Vráti thumbnail prvej fotky z albumu (pre pozadie tlačidla)."""
     photos = list_photos(album)
     if not photos:
         return ("", 404)
@@ -376,30 +433,25 @@ def album_cover(album):
         return ("", 404)
     return send_from_directory(result[0], result[1])
 
-
 @app.route("/photo/<path:filename>")
 def photo(filename):
     return send_from_directory(OUTPUT_FOLDER, filename)
 
-
 @app.route("/exif/<path:filename>")
 def exif_route(filename):
-    path     = Path(OUTPUT_FOLDER) / filename
-    date_str = ""
-    loc_str  = ""
-
+    path      = Path(OUTPUT_FOLDER) / filename
+    date_str  = ""
+    loc_str   = ""
+    lang      = LANGUAGE if LANGUAGE in MONTHS else "sk"
     exif_date = get_exif_date(path)
     if exif_date is None and path.exists():
         exif_date = datetime.fromtimestamp(path.stat().st_mtime)
     if exif_date:
-        date_str = "{} {}".format(MONTHS_SK_NOM[exif_date.month - 1], exif_date.year)
-
+        date_str = "{} {}".format(MONTHS[lang][exif_date.month - 1], exif_date.year)
     coords = get_gps_coords(path)
     if coords:
-        loc_str = reverse_geocode(coords[0], coords[1])
-
+        loc_str = reverse_geocode(coords[0], coords[1], lang)
     return jsonify({"date": date_str, "location": loc_str})
-
 
 @app.route("/delete/<path:filename>", methods=["POST"])
 def delete_photo(filename):
@@ -408,99 +460,74 @@ def delete_photo(filename):
         return jsonify({"ok": False, "error": "not found"}), 404
     kos_dir = Path(OUTPUT_FOLDER) / "_kos" / Path(filename).parent
     kos_dir.mkdir(parents=True, exist_ok=True)
-    dest    = kos_dir / src.name
-    counter = 1
+    dest = kos_dir / src.name
+    c = 1
     while dest.exists():
-        dest = kos_dir / "{}_{}.{}".format(src.stem, counter, src.suffix.lstrip("."))
-        counter += 1
+        dest = kos_dir / "{}_{}.{}".format(src.stem, c, src.suffix.lstrip("."))
+        c += 1
     src.rename(dest)
-    log.info("Presunuté do koša: {} -> {}".format(filename, dest.relative_to(Path(OUTPUT_FOLDER))))
     thumb_p = Path(OUTPUT_FOLDER) / "_thumbs" / filename
     if thumb_p.exists():
-        try:
-            thumb_p.unlink()
-        except Exception as e:
-            log.warning("Thumbnail zmazanie zlyhalo {}: {}".format(filename, e))
+        try: thumb_p.unlink()
+        except Exception: pass
     return jsonify({"ok": True})
-
 
 @app.route("/upload", methods=["POST"])
 def upload_file():
-    """Prijme jeden súbor (HEIC → skonvertuje, JPG/PNG → uloží priamo)."""
     f     = request.files.get("file")
     album = request.form.get("album", "").strip()
-
     if not f or not f.filename:
-        return jsonify({"ok": False, "error": "žiadny súbor"}), 400
-
+        return jsonify({"ok": False, "error": "no file"}), 400
     original_name = _safe_filename(f.filename)
-    ext           = Path(original_name).suffix.lower()
-
-    if album:
-        target_dir = Path(OUTPUT_FOLDER) / album
-    else:
-        target_dir = Path(OUTPUT_FOLDER)
+    ext = Path(original_name).suffix.lower()
+    target_dir = (Path(OUTPUT_FOLDER) / album) if album else Path(OUTPUT_FOLDER)
     target_dir.mkdir(parents=True, exist_ok=True)
-
     if ext in (".heic", ".heif"):
         try:
             img  = Image.open(f.stream)
             exif = img.info.get("exif")
             stem = Path(original_name).stem
             dest = target_dir / (stem + ".jpg")
-            c    = 1
+            c = 1
             while dest.exists():
-                dest = target_dir / "{}_{}.jpg".format(stem, c)
-                c += 1
+                dest = target_dir / "{}_{}.jpg".format(stem, c); c += 1
             img = ImageOps.exif_transpose(img)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+            if img.mode != "RGB": img = img.convert("RGB")
             kw = {"quality": JPG_QUALITY, "optimize": True}
-            if exif:
-                kw["exif"] = exif
+            if exif: kw["exif"] = exif
             img.save(dest, "JPEG", **kw)
-            log.info("Upload+konverzia: {} -> {}".format(original_name, dest.name))
             return jsonify({"ok": True, "saved": str(dest.relative_to(Path(OUTPUT_FOLDER)))})
         except Exception as e:
-            log.error("Upload konverzia zlyhala {}: {}".format(original_name, e))
             return jsonify({"ok": False, "error": str(e)}), 500
-
     elif ext in (".jpg", ".jpeg", ".png"):
         dest = target_dir / original_name
-        c    = 1
+        c = 1
         while dest.exists():
             dest = target_dir / "{}_{}.{}".format(Path(original_name).stem, c, ext.lstrip("."))
             c += 1
         f.save(str(dest))
-        log.info("Upload: {}".format(dest.relative_to(Path(OUTPUT_FOLDER))))
         return jsonify({"ok": True, "saved": str(dest.relative_to(Path(OUTPUT_FOLDER)))})
-
     else:
-        return jsonify({"ok": False, "error": "nepodporovaný formát (HEIC/JPG/PNG)"}), 400
-
+        return jsonify({"ok": False, "error": "unsupported format"}), 400
 
 @app.route("/scan", methods=["POST"])
 def trigger_scan():
-    """Vyžiada okamžitý scan bez čakania na interval."""
     if _has_state:
         _state.request_scan()
-        return jsonify({"ok": True, "message": "Scan naplánovaný"})
-    return jsonify({"ok": False, "message": "State modul nedostupný"}), 503
-
+        return jsonify({"ok": True})
+    return jsonify({"ok": False}), 503
 
 @app.route("/status")
 def status_route():
     if not _has_state:
-        return jsonify({"error": "state modul nedostupný"}), 503
+        return jsonify({"error": "state unavailable"}), 503
     s   = _state.get_status()
     now = time.time()
     out = {
         "converted_total": s["converted_total"],
         "scan_pending":    s["scan_pending"],
-        "last_scan":       None,
-        "last_scan_ago":   None,
-        "next_scan":       None,
-        "next_scan_in":    None,
+        "last_scan": None, "last_scan_ago": None,
+        "next_scan": None, "next_scan_in":  None,
     }
     if s["last_scan_time"]:
         out["last_scan"]     = datetime.fromtimestamp(s["last_scan_time"]).strftime("%Y-%m-%d %H:%M:%S")
@@ -510,12 +537,8 @@ def status_route():
         out["next_scan_in"] = _format_duration(max(0, int(s["next_scan_time"] - now)))
     ts = _state.get_thumb_status()
     out["thumbs"] = ts
-    if ts["running"] and ts["total"] > 0:
-        out["thumbs"]["percent"] = int(100 * ts["done"] / ts["total"])
-    else:
-        out["thumbs"]["percent"] = 100 if not ts["running"] else 0
+    out["thumbs"]["percent"] = int(100 * ts["done"] / ts["total"]) if ts["running"] and ts["total"] > 0 else (100 if not ts["running"] else 0)
     return jsonify(out)
-
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
@@ -528,393 +551,239 @@ def index():
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
-<title>Fotorámik</title>
+<title>SnapFrame</title>
 <style>
 html, body {
-  margin: 0; padding: 0;
-  width: 100%; height: 100%;
+  margin: 0; padding: 0; width: 100%; height: 100%;
   background: #0c0c0c;
   font-family: -apple-system, Helvetica, Arial, sans-serif;
-  color: #eee;
-  overflow: hidden;
+  color: #eee; overflow: hidden;
 }
-
 /* ===== VÝBERNÁ OBRAZOVKA ===== */
 #screen-select {
-  position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
-  overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
-  padding: 48px 24px 48px;
-  -webkit-box-sizing: border-box;
-  box-sizing: border-box;
-  text-align: center;
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 48px 24px 48px; -webkit-box-sizing: border-box;
+  box-sizing: border-box; text-align: center;
 }
 .sel-title {
-  font-size: 26px;
-  font-weight: 200;
-  letter-spacing: 8px;
-  text-transform: uppercase;
-  color: #fff;
-  margin-bottom: 4px;
+  font-size: 26px; font-weight: 200; letter-spacing: 8px;
+  text-transform: uppercase; color: #fff; margin-bottom: 4px;
 }
 .sel-subtitle {
-  font-size: 13px;
-  color: #444;
-  letter-spacing: 2px;
-  margin-bottom: 18px;
+  font-size: 13px; color: #444; letter-spacing: 2px; margin-bottom: 18px;
 }
-.top-actions {
-  margin-bottom: 32px;
-}
+.top-actions { margin-bottom: 32px; }
 .scan-btn {
-  background: transparent;
-  border: 1px solid #2a2a2a;
-  border-radius: 6px;
-  color: #555;
-  font-size: 12px;
-  letter-spacing: 1px;
-  padding: 7px 16px;
-  cursor: pointer;
-  outline: none;
-  -webkit-tap-highlight-color: transparent;
-  -webkit-transition: color 0.15s, border-color 0.15s;
-  transition: color 0.15s, border-color 0.15s;
+  background: transparent; border: 1px solid #2a2a2a; border-radius: 6px;
+  color: #555; font-size: 12px; letter-spacing: 1px; padding: 7px 16px;
+  cursor: pointer; outline: none; -webkit-tap-highlight-color: transparent;
+  -webkit-transition: color .15s, border-color .15s; transition: color .15s, border-color .15s;
 }
 .scan-btn.done { color: #4caf50; border-color: #4caf50; }
-
 .order-label {
-  font-size: 11px;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  color: #555;
-  margin-bottom: 10px;
+  font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+  color: #555; margin-bottom: 10px;
 }
 .order-row {
-  display: inline-block;
-  border: 1px solid #2a2a2a;
-  border-radius: 8px;
-  overflow: hidden;
-  margin-bottom: 40px;
+  display: inline-block; border: 1px solid #2a2a2a; border-radius: 8px;
+  overflow: hidden; margin-bottom: 40px;
 }
 .order-btn {
-  display: inline-block;
-  padding: 10px 24px;
-  background: transparent;
-  border: none;
-  color: #666;
-  font-size: 14px;
-  cursor: pointer;
-  outline: none;
+  display: inline-block; padding: 10px 24px; background: transparent;
+  border: none; color: #666; font-size: 14px; cursor: pointer; outline: none;
   -webkit-tap-highlight-color: transparent;
-  -webkit-transition: background 0.15s, color 0.15s;
-  transition: background 0.15s, color 0.15s;
+  -webkit-transition: background .15s, color .15s; transition: background .15s, color .15s;
 }
 .order-btn.active { background: #222; color: #fff; }
-
 .album-list {
-  text-align: left;
-  max-width: 460px;
-  margin: 0 auto 32px;
+  text-align: left; max-width: 460px; margin: 0 auto 32px;
 }
 .album-btn {
-  display: block;
-  width: 100%;
-  padding: 15px 18px;
-  margin-bottom: 10px;
-  background: #161616;
-  border: 1px solid #242424;
-  border-radius: 10px;
-  color: #ddd;
-  font-size: 16px;
-  text-align: left;
-  cursor: pointer;
-  outline: none;
-  position: relative;
-  overflow: hidden;
-  -webkit-box-sizing: border-box;
-  box-sizing: border-box;
-  -webkit-tap-highlight-color: transparent;
-  -webkit-transition: background 0.15s;
-  transition: background 0.15s;
-  background-size: cover;
-  background-position: center;
+  display: block; width: 100%; padding: 15px 18px; margin-bottom: 10px;
+  background: #161616; border: 1px solid #242424; border-radius: 10px;
+  color: #ddd; font-size: 16px; text-align: left; cursor: pointer; outline: none;
+  position: relative; overflow: hidden; -webkit-box-sizing: border-box;
+  box-sizing: border-box; -webkit-tap-highlight-color: transparent;
+  -webkit-transition: background .15s; transition: background .15s;
+  background-size: cover; background-position: center;
 }
 .album-btn:active { background-color: #222; }
 .album-btn.all-btn { border-color: #333; color: #fff; }
-/* Tmavý overlay pre čitateľnosť textu nad cover obrázkom */
 .album-btn-overlay {
-  position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
   background: rgba(0,0,0,0.62);
 }
-.album-btn-inner {
-  position: relative;
-  z-index: 1;
-}
+.album-btn-inner { position: relative; z-index: 1; }
 .album-icon { margin-right: 10px; opacity: 0.6; }
 .all-icon   { opacity: 0.9; }
 .album-count { float: right; color: #999; font-size: 13px; margin-top: 2px; }
 .sel-empty { color: #444; font-size: 14px; padding: 20px 0; text-align: center; }
-
-/* ===== UPLOAD SEKCIA ===== */
+/* ===== UPLOAD ===== */
 .upload-toggle {
-  background: transparent;
-  border: 1px solid #222;
-  border-radius: 8px;
-  color: #555;
-  font-size: 13px;
-  letter-spacing: 1px;
-  padding: 10px 22px;
-  cursor: pointer;
-  outline: none;
-  -webkit-tap-highlight-color: transparent;
-  margin-bottom: 16px;
-  display: block;
-  width: 100%;
-  max-width: 460px;
-  margin-left: auto;
-  margin-right: auto;
-  text-align: center;
-  -webkit-box-sizing: border-box;
-  box-sizing: border-box;
+  background: transparent; border: 1px solid #222; border-radius: 8px;
+  color: #555; font-size: 13px; letter-spacing: 1px; padding: 10px 22px;
+  cursor: pointer; outline: none; -webkit-tap-highlight-color: transparent;
+  margin-bottom: 16px; display: block; width: 100%; max-width: 460px;
+  margin-left: auto; margin-right: auto; text-align: center;
+  -webkit-box-sizing: border-box; box-sizing: border-box;
 }
 #upload-section {
-  display: none;
-  max-width: 460px;
-  margin: 0 auto 32px;
-  background: #111;
-  border: 1px solid #222;
-  border-radius: 12px;
-  padding: 20px 18px;
-  text-align: left;
+  display: none; max-width: 460px; margin: 0 auto 32px;
+  background: #111; border: 1px solid #222; border-radius: 12px;
+  padding: 20px 18px; text-align: left;
 }
 .upload-label {
-  font-size: 11px;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  color: #555;
-  margin-bottom: 8px;
-  display: block;
+  font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+  color: #555; margin-bottom: 8px; display: block;
 }
 .upload-select {
-  width: 100%;
-  background: #1c1c1c;
-  border: 1px solid #2c2c2c;
-  border-radius: 7px;
-  color: #ccc;
-  font-size: 14px;
-  padding: 10px 12px;
-  -webkit-box-sizing: border-box;
-  box-sizing: border-box;
-  margin-bottom: 16px;
-  outline: none;
-  -webkit-appearance: none;
+  width: 100%; background: #1c1c1c; border: 1px solid #2c2c2c;
+  border-radius: 7px; color: #ccc; font-size: 14px; padding: 10px 12px;
+  -webkit-box-sizing: border-box; box-sizing: border-box;
+  margin-bottom: 16px; outline: none; -webkit-appearance: none;
 }
 .upload-file-btn {
-  display: block;
-  width: 100%;
-  padding: 12px;
-  background: #1c1c1c;
-  border: 1px dashed #333;
-  border-radius: 8px;
-  color: #777;
-  font-size: 14px;
-  text-align: center;
-  cursor: pointer;
-  -webkit-box-sizing: border-box;
-  box-sizing: border-box;
-  margin-bottom: 14px;
-  -webkit-tap-highlight-color: transparent;
-  outline: none;
+  display: block; width: 100%; padding: 12px; background: #1c1c1c;
+  border: 1px dashed #333; border-radius: 8px; color: #777;
+  font-size: 14px; text-align: center; cursor: pointer;
+  -webkit-box-sizing: border-box; box-sizing: border-box;
+  margin-bottom: 14px; -webkit-tap-highlight-color: transparent; outline: none;
 }
 .upload-file-btn.has-files { border-color: #555; color: #bbb; }
 #upload-files { display: none; }
 .upload-go-btn {
-  display: block;
-  width: 100%;
-  padding: 13px;
-  background: #1a3a2a;
-  border: 1px solid #2a5a3a;
-  border-radius: 8px;
-  color: #5dba7e;
-  font-size: 15px;
-  text-align: center;
-  cursor: pointer;
-  outline: none;
-  -webkit-tap-highlight-color: transparent;
-  -webkit-box-sizing: border-box;
-  box-sizing: border-box;
-  -webkit-transition: background 0.15s;
-  transition: background 0.15s;
+  display: block; width: 100%; padding: 13px;
+  background: #1a3a2a; border: 1px solid #2a5a3a; border-radius: 8px;
+  color: #5dba7e; font-size: 15px; text-align: center; cursor: pointer;
+  outline: none; -webkit-tap-highlight-color: transparent;
+  -webkit-box-sizing: border-box; box-sizing: border-box;
+  -webkit-transition: background .15s; transition: background .15s;
 }
 .upload-go-btn:disabled { opacity: 0.4; }
 .upload-status {
-  margin-top: 12px;
-  font-size: 13px;
-  color: #666;
-  min-height: 20px;
-  text-align: center;
+  margin-top: 12px; font-size: 13px; color: #666; min-height: 20px; text-align: center;
 }
 .upload-status.ok  { color: #5dba7e; }
 .upload-status.err { color: #c0392b; }
-
 /* ===== SLIDESHOW ===== */
 #screen-slideshow {
-  position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: #000;
-  display: none;
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  background: #000; display: none;
 }
 .photo {
-  position: absolute;
-  top: 0; left: 0; width: 100%; height: 100%;
-  background-position: center center;
-  background-repeat: no-repeat;
-  background-size: contain;
-  opacity: 0;
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  background-position: center center; background-repeat: no-repeat;
+  background-size: contain; opacity: 0;
   -webkit-transition: opacity 1.5s ease-in-out, -webkit-transform 1.8s ease-in-out;
   transition: opacity 1.5s ease-in-out, transform 1.8s ease-in-out;
 }
-.photo.fade-start      { -webkit-transform: scale(1);        transform: scale(1); }
-.photo.fade-end        { -webkit-transform: scale(1);        transform: scale(1); }
-.photo.zoomin-start    { -webkit-transform: scale(1.0);      transform: scale(1.0); }
-.photo.zoomin-end      { -webkit-transform: scale(1.12);     transform: scale(1.12); }
-.photo.zoomout-start   { -webkit-transform: scale(1.12);     transform: scale(1.12); }
-.photo.zoomout-end     { -webkit-transform: scale(1.0);      transform: scale(1.0); }
-.photo.slideleft-start { -webkit-transform: translateX(4%);  transform: translateX(4%); }
-.photo.slideleft-end   { -webkit-transform: translateX(0);   transform: translateX(0); }
-.photo.slideup-start   { -webkit-transform: translateY(4%);  transform: translateY(4%); }
-.photo.slideup-end     { -webkit-transform: translateY(0);   transform: translateY(0); }
+.photo.fade-start      { -webkit-transform: scale(1);       transform: scale(1); }
+.photo.fade-end        { -webkit-transform: scale(1);       transform: scale(1); }
+.photo.zoomin-start    { -webkit-transform: scale(1.0);     transform: scale(1.0); }
+.photo.zoomin-end      { -webkit-transform: scale(1.12);    transform: scale(1.12); }
+.photo.zoomout-start   { -webkit-transform: scale(1.12);    transform: scale(1.12); }
+.photo.zoomout-end     { -webkit-transform: scale(1.0);     transform: scale(1.0); }
+.photo.slideleft-start { -webkit-transform: translateX(4%); transform: translateX(4%); }
+.photo.slideleft-end   { -webkit-transform: translateX(0);  transform: translateX(0); }
+.photo.slideup-start   { -webkit-transform: translateY(4%); transform: translateY(4%); }
+.photo.slideup-end     { -webkit-transform: translateY(0);  transform: translateY(0); }
 .photo.visible { opacity: 1; }
-
-/* Počítadlo fotiek */
 #photo-counter {
-  position: absolute;
-  top: 14px; right: 18px;
-  z-index: 90;
-  color: rgba(255,255,255,0.32);
-  font-size: 13px;
-  letter-spacing: 1px;
-  pointer-events: none;
-  text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+  position: absolute; top: 14px; right: 18px; z-index: 90;
+  color: rgba(255,255,255,0.32); font-size: 13px; letter-spacing: 1px;
+  pointer-events: none; text-shadow: 0 1px 4px rgba(0,0,0,0.8);
 }
-
-/* EXIF overlay */
 #overlay {
-  position: absolute;
-  bottom: 18px; left: 18px; right: 18px;
-  z-index: 90;
-  pointer-events: none;
+  position: absolute; bottom: 18px; left: 18px; right: 18px;
+  z-index: 90; pointer-events: none;
 }
 #overlay-date {
-  font-size: 26px;
-  font-weight: 300;
-  line-height: 1.1;
-  letter-spacing: 1px;
-  color: rgba(255,255,255,0.80);
-  margin-bottom: 5px;
+  font-size: 26px; font-weight: 300; line-height: 1.1; letter-spacing: 1px;
+  color: rgba(255,255,255,0.80); margin-bottom: 5px;
   text-shadow: 0 2px 10px rgba(0,0,0,0.95), 0 0 24px rgba(0,0,0,0.8);
 }
 #overlay-location {
-  font-size: 36px;
-  font-weight: 200;
-  line-height: 1.1;
+  font-size: 36px; font-weight: 200; line-height: 1.1;
   color: rgba(255,255,255,0.93);
   text-shadow: 0 2px 10px rgba(0,0,0,0.95), 0 0 24px rgba(0,0,0,0.8);
 }
-
-/* Delete dialog */
-#delete-dialog {
-  position: absolute;
+/* ===== SLEEP ===== */
+#screen-sleep {
+  display: none; position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
-  z-index: 200;
-  background: rgba(0,0,0,0.68);
+  background: #000; z-index: 500;
+}
+/* ===== DELETE DIALOG ===== */
+#delete-dialog {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 200; background: rgba(0,0,0,0.68); display: none;
 }
 .del-box {
-  position: absolute;
-  top: 50%; left: 50%;
-  -webkit-transform: translate(-50%, -50%);
-  transform: translate(-50%, -50%);
-  background: #1c1c1e;
-  border-radius: 14px;
-  padding: 30px 26px 24px;
-  text-align: center;
-  min-width: 270px; max-width: 340px;
+  position: absolute; top: 50%; left: 50%;
+  -webkit-transform: translate(-50%, -50%); transform: translate(-50%, -50%);
+  background: #1c1c1e; border-radius: 14px;
+  padding: 30px 26px 24px; text-align: center; min-width: 270px; max-width: 340px;
 }
 .del-title { font-size: 17px; color: #fff; margin-bottom: 8px; }
 .del-sub   { font-size: 13px; color: #888; margin-bottom: 26px; }
 .del-yes {
-  background: #c0392b; color: #fff; border: none;
-  border-radius: 9px; padding: 12px 28px; font-size: 16px;
-  margin-right: 10px; cursor: pointer; outline: none;
-  -webkit-tap-highlight-color: transparent;
+  background: #c0392b; color: #fff; border: none; border-radius: 9px;
+  padding: 12px 28px; font-size: 16px; margin-right: 10px;
+  cursor: pointer; outline: none; -webkit-tap-highlight-color: transparent;
 }
 .del-no {
-  background: #2c2c2e; color: #ccc; border: none;
-  border-radius: 9px; padding: 12px 28px; font-size: 16px;
-  cursor: pointer; outline: none;
-  -webkit-tap-highlight-color: transparent;
+  background: #2c2c2e; color: #ccc; border: none; border-radius: 9px;
+  padding: 12px 28px; font-size: 16px;
+  cursor: pointer; outline: none; -webkit-tap-highlight-color: transparent;
 }
-
 #ss-msg {
-  position: absolute;
-  top: 50%; left: 0; right: 0;
-  text-align: center;
-  color: #444;
-  font-size: 17px;
-  -webkit-transform: translateY(-50%);
-  transform: translateY(-50%);
-  display: none;
+  position: absolute; top: 50%; left: 0; right: 0; text-align: center;
+  color: #444; font-size: 17px;
+  -webkit-transform: translateY(-50%); transform: translateY(-50%); display: none;
 }
 </style>
 </head>
 <body>
 
-<!-- ========== VÝBERNÁ OBRAZOVKA ========== -->
+<!-- SLEEP OVERLAY -->
+<div id="screen-sleep"></div>
+
+<!-- VÝBERNÁ OBRAZOVKA -->
 <div id="screen-select">
-  <div class="sel-title">Fotorámik</div>
-  <div class="sel-subtitle">FOTO RÁMIK</div>
-
+  <div class="sel-title" id="t-app-title"></div>
+  <div class="sel-subtitle" id="t-app-subtitle"></div>
   <div class="top-actions">
-    <button id="scan-btn" class="scan-btn" onclick="triggerScan()">↻ Skenuj teraz</button>
+    <button id="scan-btn" class="scan-btn" onclick="triggerScan()"></button>
   </div>
-
-  <div class="order-label">Poradie fotiek</div>
+  <div class="order-label" id="t-order-label"></div>
   <div class="order-row">
-    <button class="order-btn active" id="btn-order-date" onclick="setOrder('date')">Chronologicky</button>
-    <button class="order-btn"        id="btn-order-rand" onclick="setOrder('random')">Náhodne</button>
+    <button class="order-btn active" id="btn-order-date" onclick="setOrder('date')"></button>
+    <button class="order-btn"        id="btn-order-rand" onclick="setOrder('random')"></button>
   </div>
-
-  <div class="album-list" id="album-list">
-    <div class="sel-empty">Načítavam albumy…</div>
-  </div>
-
-  <!-- Upload sekcia -->
-  <button class="upload-toggle" onclick="toggleUpload()">&#8679; Nahrať fotky</button>
+  <div class="album-list" id="album-list"></div>
+  <button class="upload-toggle" onclick="toggleUpload()" id="t-upload-toggle"></button>
   <div id="upload-section">
-    <label class="upload-label">Cieľový album</label>
+    <label class="upload-label" id="t-upload-album-label"></label>
     <select id="upload-album" class="upload-select" onchange="onAlbumChange(this)">
-      <option value="">Koreňový priečinok</option>
-      <option value="__new__">— Nový album… —</option>
+      <option value="" id="t-upload-root"></option>
+      <option value="__new__" id="t-upload-new-option"></option>
     </select>
     <input type="text" id="upload-new-album" class="upload-select"
-           placeholder="Názov nového albumu"
-           style="display:none;margin-top:-6px"
-           oninput="onNewAlbumInput(this)">
-    <label class="upload-label">Súbory (HEIC, JPG, PNG)</label>
-    <button class="upload-file-btn" id="upload-file-btn" onclick="document.getElementById('upload-files').click()">
-      Vybrať súbory…
-    </button>
-    <input type="file" id="upload-files" multiple accept=".heic,.heif,.jpg,.jpeg,.png,image/*"
+           style="display:none;margin-top:-6px" oninput="onNewAlbumInput(this)">
+    <label class="upload-label" id="t-upload-files-label"></label>
+    <button class="upload-file-btn" id="upload-file-btn"
+            onclick="document.getElementById('upload-files').click()"></button>
+    <input type="file" id="upload-files" multiple
+           accept=".heic,.heif,.jpg,.jpeg,.png,image/*"
            onchange="onFilesSelected(this)">
-    <button class="upload-go-btn" id="upload-go-btn" onclick="startUpload()">Nahrať</button>
+    <button class="upload-go-btn" id="upload-go-btn" onclick="startUpload()"></button>
     <div class="upload-status" id="upload-status"></div>
   </div>
 </div>
 
-<!-- ========== SLIDESHOW ========== -->
-<div id="screen-slideshow" style="display:none">
+<!-- SLIDESHOW -->
+<div id="screen-slideshow">
   <div class="photo" id="photoA"></div>
   <div class="photo" id="photoB"></div>
   <div id="photo-counter"></div>
@@ -922,68 +791,102 @@ html, body {
     <div id="overlay-date"></div>
     <div id="overlay-location"></div>
   </div>
-  <div id="ss-msg">Žiadne fotky v tomto albume</div>
-  <div id="delete-dialog" style="display:none">
+  <div id="ss-msg"></div>
+  <div id="delete-dialog">
     <div class="del-box">
-      <div class="del-title">Odstrániť túto fotku?</div>
-      <div class="del-sub">Fotka bude presunutá do koša</div>
-      <button class="del-yes" onclick="confirmDelete()">Odstrániť</button>
-      <button class="del-no"  onclick="hideDeleteDialog()">Zrušiť</button>
+      <div class="del-title" id="t-del-title"></div>
+      <div class="del-sub"   id="t-del-sub"></div>
+      <button class="del-yes" id="t-del-yes" onclick="confirmDelete()"></button>
+      <button class="del-no"  id="t-del-no"  onclick="hideDeleteDialog()"></button>
     </div>
   </div>
 </div>
 
 <script>
-var SLIDESHOW_SECONDS = __SLIDESHOW_SECONDS__;
+// ── Injektované serverom ──────────────────────────────────────────────────────
+var TR               = __SNAPFRAME_TR__;
+var SLIDESHOW_SECS   = __SLIDESHOW_SECS__;
+var SLEEP_START      = "__SLEEP_START__";
+var SLEEP_END        = "__SLEEP_END__";
 
-var currentOrder   = "date";
-var currentAlbum   = "";
-var photos         = [];
-var currentIndex   = -1;
-var activeIsA      = true;
-var advanceTimer   = null;
-var refreshTimer   = null;
-var slideshowActive = false;
+// ── i18n helpers ──────────────────────────────────────────────────────────────
+function tr(k)       { return TR[k] || k; }
+function trf(k, arr) {
+  var s = TR[k] || k;
+  for (var i = 0; i < arr.length; i++) { s = s.replace("{" + i + "}", arr[i]); }
+  return s;
+}
 
-// Zoznam albumov pre bezpečné indexovanie
-var albumNames = [];
+// ── Naplň preložené texty do DOM ──────────────────────────────────────────────
+function applyTranslations() {
+  document.getElementById("t-app-title").textContent     = tr("app_title");
+  document.getElementById("t-app-subtitle").textContent  = tr("app_subtitle");
+  document.getElementById("scan-btn").textContent        = tr("scan_btn");
+  document.getElementById("t-order-label").textContent   = tr("order_label");
+  document.getElementById("btn-order-date").textContent  = tr("order_date");
+  document.getElementById("btn-order-rand").textContent  = tr("order_random");
+  document.getElementById("t-upload-toggle").textContent = tr("upload_toggle");
+  document.getElementById("t-upload-album-label").textContent = tr("upload_album_label");
+  document.getElementById("t-upload-root").textContent   = tr("upload_root");
+  document.getElementById("t-upload-new-option").textContent  = tr("upload_new_option");
+  document.getElementById("upload-new-album").placeholder     = tr("upload_new_ph");
+  document.getElementById("t-upload-files-label").textContent = tr("upload_files_label");
+  document.getElementById("upload-file-btn").textContent = tr("upload_select");
+  document.getElementById("upload-go-btn").textContent   = tr("upload_go");
+  document.getElementById("ss-msg").textContent          = tr("no_photos");
+  document.getElementById("t-del-title").textContent     = tr("delete_title");
+  document.getElementById("t-del-sub").textContent       = tr("delete_sub");
+  document.getElementById("t-del-yes").textContent       = tr("delete_yes");
+  document.getElementById("t-del-no").textContent        = tr("delete_no");
+}
 
-// ── Pomocné funkcie ───────────────────────────────────────────────────────────
+// ── Sleep mode ────────────────────────────────────────────────────────────────
+function _toMin(t) {
+  var p = t.split(":"); return parseInt(p[0], 10) * 60 + parseInt(p[1], 10);
+}
+function checkSleep() {
+  var el = document.getElementById("screen-sleep");
+  if (!SLEEP_START || !SLEEP_END) { el.style.display = "none"; return; }
+  var now = new Date();
+  var cur = now.getHours() * 60 + now.getMinutes();
+  var s   = _toMin(SLEEP_START);
+  var e   = _toMin(SLEEP_END);
+  var sleeping = (s < e) ? (cur >= s && cur < e) : (cur >= s || cur < e);
+  el.style.display = sleeping ? "block" : "none";
+}
+setInterval(checkSleep, 60000);
 
-function xhrGet(url, callback) {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function xhrGet(url, cb) {
   var xhr = new XMLHttpRequest();
   xhr.open("GET", url, true);
-  xhr.onreadystatechange = function () {
+  xhr.onreadystatechange = function() {
     if (xhr.readyState === 4) {
-      if (xhr.status === 200) { callback(null, xhr.responseText); }
-      else { callback(new Error("HTTP " + xhr.status), null); }
+      cb(xhr.status === 200 ? null : new Error("HTTP " + xhr.status), xhr.responseText);
     }
   };
   xhr.send();
 }
-
 function escHtml(s) {
   return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
-
-function encodePath(path) {
-  var parts = path.split("/"), out = [];
+function encodePath(p) {
+  var parts = p.split("/"), out = [];
   for (var i = 0; i < parts.length; i++) { out.push(encodeURIComponent(parts[i])); }
   return out.join("/");
 }
 
-// ── Trigger manuálneho skenu ──────────────────────────────────────────────────
-
+// ── Scan trigger ──────────────────────────────────────────────────────────────
 function triggerScan() {
   var btn = document.getElementById("scan-btn");
   var xhr = new XMLHttpRequest();
   xhr.open("POST", "/scan", true);
-  xhr.onreadystatechange = function () {
+  xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
-    btn.innerHTML = "✓ Spustené";
+    btn.textContent = tr("scan_started");
     btn.className = "scan-btn done";
-    setTimeout(function () {
-      btn.innerHTML = "↻ Skenuj teraz";
+    setTimeout(function() {
+      btn.textContent = tr("scan_btn");
       btn.className = "scan-btn";
     }, 3000);
   };
@@ -991,6 +894,8 @@ function triggerScan() {
 }
 
 // ── Výberná obrazovka ─────────────────────────────────────────────────────────
+var currentOrder = "date";
+var albumNames   = [];
 
 function setOrder(order) {
   currentOrder = order;
@@ -999,58 +904,50 @@ function setOrder(order) {
 }
 
 function loadAlbums() {
-  xhrGet("/albums", function (err, text) {
-    var listEl = document.getElementById("album-list");
+  var listEl = document.getElementById("album-list");
+  listEl.innerHTML = "<div class='sel-empty'>" + escHtml(tr("loading_albums")) + "</div>";
+  xhrGet("/albums", function(err, text) {
     if (err) {
-      listEl.innerHTML = "<div class='sel-empty'>Chyba: " + escHtml(err.message) + "</div>";
+      listEl.innerHTML = "<div class='sel-empty'>" + escHtml(err.message) + "</div>";
       return;
     }
     var data;
-    try { data = JSON.parse(text); } catch (e) { return; }
-
+    try { data = JSON.parse(text); } catch(e) { return; }
     var albums = data.albums || [];
     albumNames = [];
     for (var i = 0; i < albums.length; i++) { albumNames.push(albums[i].name); }
-
-    // Celkový počet
     var totalCount = 0;
     for (var i = 0; i < albums.length; i++) { totalCount += (albums[i].count || 0); }
-
     var html = "<button class='album-btn all-btn' onclick='startSlideshow(\"all\")'>"
-             + "<div class='album-btn-overlay'></div>"
-             + "<div class='album-btn-inner'>"
-             + "<span class='album-icon all-icon'>&#9654;</span>Všetko"
+             + "<div class='album-btn-overlay'></div><div class='album-btn-inner'>"
+             + "<span class='album-icon all-icon'>&#9654;</span>"
+             + escHtml(tr("all_photos"))
              + "<span class='album-count'>" + totalCount + "</span>"
              + "</div></button>";
-
     for (var i = 0; i < albums.length; i++) {
       html += "<button class='album-btn' id='album-btn-" + i + "' onclick='startSlideshowIdx(" + i + ")'>"
-            + "<div class='album-btn-overlay'></div>"
-            + "<div class='album-btn-inner'>"
+            + "<div class='album-btn-overlay'></div><div class='album-btn-inner'>"
             + "<span class='album-icon'>&#128193;</span>"
             + escHtml(albums[i].name)
             + "<span class='album-count'>" + (albums[i].count || 0) + "</span>"
             + "</div></button>";
     }
     if (albums.length === 0) {
-      html += "<div class='sel-empty'>Žiadne albumy (podpriečinky)</div>";
+      html += "<div class='sel-empty'>" + escHtml(tr("no_albums")) + "</div>";
     }
     listEl.innerHTML = html;
-
-    // Načítaj covery albumov
     loadAlbumCovers();
-    // Naplň upload select
     populateUploadAlbums(albums);
   });
 }
 
 function loadAlbumCovers() {
   for (var i = 0; i < albumNames.length; i++) {
-    (function (name, idx) {
+    (function(name, idx) {
       var btn = document.getElementById("album-btn-" + idx);
       if (!btn) { return; }
       var img = new Image();
-      img.onload = function () {
+      img.onload = function() {
         btn.style.backgroundImage = "url('/album-cover/" + encodeURIComponent(name) + "')";
       };
       img.src = "/album-cover/" + encodeURIComponent(name);
@@ -1063,18 +960,14 @@ function startSlideshowIdx(i) { startSlideshow(albumNames[i]); }
 function goBack() {
   if (advanceTimer) { clearInterval(advanceTimer); advanceTimer = null; }
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
-
   photos = []; currentIndex = -1; activeIsA = true;
-
   var a = document.getElementById("photoA");
   var b = document.getElementById("photoB");
   a.style.backgroundImage = ""; a.className = "photo";
   b.style.backgroundImage = ""; b.className = "photo";
-
   document.getElementById("overlay-date").innerHTML     = "";
   document.getElementById("overlay-location").innerHTML = "";
   document.getElementById("photo-counter").innerHTML    = "";
-
   slideshowActive = false;
   document.getElementById("screen-slideshow").style.display = "none";
   document.getElementById("screen-select").style.display    = "";
@@ -1082,142 +975,114 @@ function goBack() {
 }
 
 // ── Slideshow ─────────────────────────────────────────────────────────────────
+var photos = [], currentIndex = -1, activeIsA = true;
+var advanceTimer = null, refreshTimer = null, slideshowActive = false;
+var currentAlbum = "";
+var EFFECTS = ["fade", "zoomin", "zoomout", "slideleft", "slideup"];
 
 function startSlideshow(album) {
-  currentAlbum    = album;
-  slideshowActive = true;
+  currentAlbum = album; slideshowActive = true;
   document.getElementById("screen-select").style.display    = "none";
   document.getElementById("screen-slideshow").style.display = "block";
   document.getElementById("ss-msg").style.display           = "none";
-
   fetchPhotosAndStart();
-
-  // Každých 5 minút aktualizuj zoznam (opravené: vždy, nielen pri pribúdaní)
-  refreshTimer = setInterval(function () {
-    fetchPhotos(function (newList) {
-      if (newList.length === 0) { return; }
-      var oldLen = photos.length;
+  refreshTimer = setInterval(function() {
+    fetchPhotos(function(newList) {
+      if (!newList.length) { return; }
       photos = newList;
-      // Uprav index ak sa zoznam skrátil
-      if (currentIndex >= photos.length) {
-        currentIndex = photos.length - 1;
-      }
-      if (oldLen === 0 && photos.length > 0) {
-        document.getElementById("ss-msg").style.display = "none";
-        currentIndex = 0;
-        showPhoto(0);
-        startAdvanceTimer();
-      }
+      if (currentIndex >= photos.length) { currentIndex = photos.length - 1; }
     });
   }, 5 * 60 * 1000);
 }
 
-function fetchPhotos(callback) {
-  var url = "/photos?album=" + encodeURIComponent(currentAlbum) + "&order=" + currentOrder;
-  xhrGet(url, function (err, text) {
-    if (err) { if (callback) { callback([]); } return; }
-    try {
-      var data = JSON.parse(text);
-      if (callback) { callback(data.photos || []); }
-    } catch (e) { if (callback) { callback([]); } }
-  });
+function fetchPhotos(cb) {
+  xhrGet("/photos?album=" + encodeURIComponent(currentAlbum) + "&order=" + currentOrder,
+    function(err, text) {
+      if (err) { if (cb) { cb([]); } return; }
+      try { if (cb) { cb(JSON.parse(text).photos || []); } }
+      catch(e) { if (cb) { cb([]); } }
+    });
 }
 
 function fetchPhotosAndStart() {
-  fetchPhotos(function (list) {
+  fetchPhotos(function(list) {
     photos = list;
-    if (photos.length === 0) {
-      document.getElementById("ss-msg").style.display = "block";
-      return;
+    if (!photos.length) {
+      document.getElementById("ss-msg").style.display = "block"; return;
     }
     currentIndex = 0; activeIsA = true;
-    showPhoto(0);
-    startAdvanceTimer();
+    showPhoto(0); startAdvanceTimer();
   });
 }
 
-var EFFECTS = ["fade", "zoomin", "zoomout", "slideleft", "slideup"];
 function pickEffect() { return EFFECTS[Math.floor(Math.random() * EFFECTS.length)]; }
 
 function showPhoto(index) {
-  if (photos.length === 0) { return; }
+  if (!photos.length) { return; }
   var idx      = ((index % photos.length) + photos.length) % photos.length;
   var filename = photos[idx];
   var url      = "/thumb/" + encodePath(filename);
   var nextEl   = activeIsA ? document.getElementById("photoB") : document.getElementById("photoA");
   var prevEl   = activeIsA ? document.getElementById("photoA") : document.getElementById("photoB");
   var effect   = pickEffect();
-
   nextEl.style.backgroundImage = "url(" + url + ")";
   nextEl.className = "photo " + effect + "-start";
-
-  setTimeout(function () {
+  setTimeout(function() {
     nextEl.className = "photo visible " + effect + "-end";
     prevEl.className = "photo";
   }, 50);
-
   activeIsA = !activeIsA;
-
-  // Počítadlo
   document.getElementById("photo-counter").innerHTML = (idx + 1) + " / " + photos.length;
-
   loadExifOverlay(filename);
 }
 
 function loadExifOverlay(filename) {
   document.getElementById("overlay-date").innerHTML     = "";
   document.getElementById("overlay-location").innerHTML = "";
-  xhrGet("/exif/" + encodePath(filename), function (err, text) {
+  xhrGet("/exif/" + encodePath(filename), function(err, text) {
     if (err) { return; }
     try {
       var data = JSON.parse(text);
       document.getElementById("overlay-date").innerHTML     = escHtml(data.date     || "");
       document.getElementById("overlay-location").innerHTML = escHtml(data.location || "");
-    } catch (e) {}
+    } catch(e) {}
   });
 }
 
 function startAdvanceTimer() {
   if (advanceTimer) { clearInterval(advanceTimer); }
-  advanceTimer = setInterval(function () {
+  advanceTimer = setInterval(function() {
     currentIndex = (currentIndex + 1) % photos.length;
     showPhoto(currentIndex);
-  }, SLIDESHOW_SECONDS * 1000);
+  }, SLIDESHOW_SECS * 1000);
 }
 
 // ── Swipe + dlhý tap ──────────────────────────────────────────────────────────
+var swipeTouchStartX = 0, swipeTouchStartY = 0;
+var longPressTimer = null, longPressFired = false;
 
-var swipeTouchStartX = 0;
-var swipeTouchStartY = 0;
-var longPressTimer   = null;
-var longPressFired   = false;
-
-function isSlideshow() { return slideshowActive; }
-
-document.addEventListener("touchstart", function (e) {
+document.addEventListener("touchstart", function(e) {
   swipeTouchStartX = e.touches[0].clientX;
   swipeTouchStartY = e.touches[0].clientY;
-  longPressFired   = false;
-  if (isSlideshow()) {
-    longPressTimer = setTimeout(function () {
-      longPressFired = true;
-      showDeleteDialog();
+  longPressFired = false;
+  if (slideshowActive) {
+    longPressTimer = setTimeout(function() {
+      longPressFired = true; showDeleteDialog();
     }, 750);
   }
 }, false);
 
-document.addEventListener("touchmove", function (e) {
+document.addEventListener("touchmove", function(e) {
   if (!longPressTimer) { return; }
-  var dx = e.touches[0].clientX - swipeTouchStartX;
-  var dy = e.touches[0].clientY - swipeTouchStartY;
-  if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+  if (Math.abs(e.touches[0].clientX - swipeTouchStartX) > 10 ||
+      Math.abs(e.touches[0].clientY - swipeTouchStartY) > 10) {
     clearTimeout(longPressTimer); longPressTimer = null;
   }
 }, false);
 
-document.addEventListener("touchend", function (e) {
+document.addEventListener("touchend", function(e) {
   if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-  if (longPressFired || !isSlideshow()) { return; }
+  if (longPressFired || !slideshowActive) { return; }
   var dx = e.changedTouches[0].clientX - swipeTouchStartX;
   var dy = e.changedTouches[0].clientY - swipeTouchStartY;
   if (Math.abs(dy) > 80 && Math.abs(dx) < 80) { goBack(); return; }
@@ -1229,55 +1094,49 @@ document.addEventListener("touchend", function (e) {
   if (dx < -80 && Math.abs(dy) < 60) {
     if (advanceTimer) { clearInterval(advanceTimer); }
     currentIndex = (currentIndex + 1) % photos.length;
-    showPhoto(currentIndex); startAdvanceTimer(); return;
+    showPhoto(currentIndex); startAdvanceTimer();
   }
 }, false);
 
 // ── Mazanie ───────────────────────────────────────────────────────────────────
-
 function showDeleteDialog()  { document.getElementById("delete-dialog").style.display = "block"; }
-function hideDeleteDialog()  { document.getElementById("delete-dialog").style.display = "none";  }
+function hideDeleteDialog()  { document.getElementById("delete-dialog").style.display = "none"; }
 
 function confirmDelete() {
   hideDeleteDialog();
-  if (photos.length === 0) { return; }
+  if (!photos.length) { return; }
   var filename = photos[currentIndex];
   var xhr = new XMLHttpRequest();
   xhr.open("POST", "/delete/" + encodePath(filename), true);
-  xhr.onreadystatechange = function () {
+  xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
     photos.splice(currentIndex, 1);
-    if (photos.length === 0) {
+    if (!photos.length) {
       document.getElementById("photoA").className = "photo";
       document.getElementById("photoB").className = "photo";
       document.getElementById("photo-counter").innerHTML = "";
-      document.getElementById("ss-msg").style.display = "block";
-      return;
+      document.getElementById("ss-msg").style.display = "block"; return;
     }
     currentIndex = currentIndex % photos.length;
     document.getElementById("photoA").className = "photo";
     document.getElementById("photoB").className = "photo";
-    activeIsA = true;
-    showPhoto(currentIndex);
+    activeIsA = true; showPhoto(currentIndex);
   };
   xhr.send();
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
-
 function toggleUpload() {
   var sec = document.getElementById("upload-section");
-  sec.style.display = (sec.style.display === "none" || sec.style.display === "") ? "block" : "none";
+  sec.style.display = (sec.style.display === "none" || !sec.style.display) ? "block" : "none";
 }
 
 function populateUploadAlbums(albums) {
   var sel = document.getElementById("upload-album");
-  // Ponechaj koreň (index 0) + Nový album (posledný), obnov prostredné
   while (sel.options.length > 2) { sel.remove(1); }
   for (var i = 0; i < albums.length; i++) {
     var opt = document.createElement("option");
-    opt.value       = albums[i].name;
-    opt.textContent = albums[i].name;
+    opt.value = albums[i].name; opt.textContent = albums[i].name;
     sel.insertBefore(opt, sel.options[sel.options.length - 1]);
   }
 }
@@ -1285,11 +1144,9 @@ function populateUploadAlbums(albums) {
 function onAlbumChange(sel) {
   var newInput = document.getElementById("upload-new-album");
   if (sel.value === "__new__") {
-    newInput.style.display = "block";
-    newInput.focus();
+    newInput.style.display = "block"; newInput.focus();
   } else {
-    newInput.style.display = "none";
-    newInput.value = "";
+    newInput.style.display = "none"; newInput.value = "";
   }
 }
 
@@ -1314,127 +1171,115 @@ function onFilesSelected(input) {
   var btn = document.getElementById("upload-file-btn");
   if (input.files && input.files.length > 0) {
     btn.className = "upload-file-btn has-files";
-    btn.innerHTML = input.files.length + " súbor" + (input.files.length > 1 ? "y vybraté" : " vybratý");
+    btn.textContent = trf("upload_selected", [input.files.length]);
   } else {
     btn.className = "upload-file-btn";
-    btn.innerHTML = "Vybrať súbory…";
+    btn.textContent = tr("upload_select");
   }
-  document.getElementById("upload-status").innerHTML  = "";
-  document.getElementById("upload-status").className  = "upload-status";
+  document.getElementById("upload-status").innerHTML = "";
+  document.getElementById("upload-status").className = "upload-status";
 }
 
 function startUpload() {
-  var input = document.getElementById("upload-files");
-  var files = input.files;
-  if (!files || files.length === 0) {
-    var statusEl = document.getElementById("upload-status");
-    statusEl.innerHTML = "Najprv vyber súbory.";
-    statusEl.className = "upload-status err";
-    return;
+  var input  = document.getElementById("upload-files");
+  var status = document.getElementById("upload-status");
+  if (!input.files || !input.files.length) {
+    status.innerHTML = tr("upload_err_files"); status.className = "upload-status err"; return;
   }
-  document.getElementById("upload-go-btn").disabled = true;
   var album = _getTargetAlbum();
   if (document.getElementById("upload-album").value === "__new__" && !album) {
-    var statusEl = document.getElementById("upload-status");
-    statusEl.innerHTML = "Zadaj názov nového albumu."; statusEl.className = "upload-status err";
-    document.getElementById("upload-go-btn").disabled = false; return;
+    status.innerHTML = tr("upload_err_name"); status.className = "upload-status err"; return;
   }
-  _uploadNext(files, 0, album, 0);
+  document.getElementById("upload-go-btn").disabled = true;
+  _uploadNext(input.files, 0, album, 0);
 }
 
 function _uploadNext(files, idx, album, errCount) {
-  var statusEl = document.getElementById("upload-status");
+  var status = document.getElementById("upload-status");
   if (idx >= files.length) {
-    var msg = "✓ " + files.length + " fotiek nahraných";
-    if (errCount > 0) { msg += " (" + errCount + " chýb)"; }
-    statusEl.innerHTML = msg;
-    statusEl.className = "upload-status " + (errCount > 0 ? "err" : "ok");
+    var msg = trf("upload_done", [files.length]);
+    if (errCount > 0) { msg += " " + trf("upload_errors", [errCount]); }
+    status.innerHTML = msg;
+    status.className = "upload-status " + (errCount > 0 ? "err" : "ok");
     document.getElementById("upload-go-btn").disabled = false;
     document.getElementById("upload-files").value = "";
-    var btn = document.getElementById("upload-file-btn");
-    btn.className = "upload-file-btn";
-    btn.innerHTML = "Vybrať súbory…";
-    loadAlbums();  // obnov zoznam albumov
-    return;
+    document.getElementById("upload-file-btn").className   = "upload-file-btn";
+    document.getElementById("upload-file-btn").textContent = tr("upload_select");
+    loadAlbums(); return;
   }
-  statusEl.className = "upload-status";
-  statusEl.innerHTML = "Nahrávam " + (idx + 1) + " / " + files.length + ": " + escHtml(files[idx].name);
-
+  status.className = "upload-status";
+  status.innerHTML = trf("upload_progress", [idx + 1, files.length, escHtml(files[idx].name)]);
   var fd = new FormData();
-  fd.append("file",  files[idx]);
-  fd.append("album", album);
-
+  fd.append("file", files[idx]); fd.append("album", album);
   var xhr = new XMLHttpRequest();
   xhr.open("POST", "/upload", true);
-  xhr.onreadystatechange = function () {
+  xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
-    var newErrCount = errCount + (xhr.status === 200 ? 0 : 1);
-    _uploadNext(files, idx + 1, album, newErrCount);
+    _uploadNext(files, idx + 1, album, errCount + (xhr.status === 200 ? 0 : 1));
   };
   xhr.send(fd);
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Štart ─────────────────────────────────────────────────────────────────────
+applyTranslations();
+checkSleep();
 loadAlbums();
 </script>
 </body>
 </html>"""
-    html = html.replace("__SLIDESHOW_SECONDS__", str(SLIDESHOW_SECONDS))
+    lang = LANGUAGE if LANGUAGE in TRANSLATIONS else "sk"
+    html = html.replace("__SNAPFRAME_TR__",  json_module.dumps(TRANSLATIONS[lang], ensure_ascii=False))
+    html = html.replace("__SLIDESHOW_SECS__", str(SLIDESHOW_SECS))
+    html = html.replace("__SLEEP_START__",    SLEEP_START)
+    html = html.replace("__SLEEP_END__",      SLEEP_END)
     return Response(html, mimetype="text/html; charset=utf-8")
 
 
+# ── Thumbnail pregenerácia ────────────────────────────────────────────────────
+
 def pregenerate_thumbs():
-    """
-    Vygeneruje chybajuce thumbnaile pre vsetky fotky v OUTPUT_FOLDER.
-    Vola sa z watcher.py vo vlakne na pozadi.
-    """
     HIDDEN = {"_kos", "_thumbs"}
     folder = Path(OUTPUT_FOLDER)
     if not folder.exists():
         return
     all_photos = [
         f for f in folder.rglob("*")
-        if f.is_file()
-        and f.suffix.lower() in ALLOWED_EXT
+        if f.is_file() and f.suffix.lower() in ALLOWED_EXT
         and not any(p in HIDDEN for p in f.relative_to(folder).parts)
     ]
     total = len(all_photos)
-    if total == 0:
+    if not total:
         return
-    log.info("Pregeneracia thumbnailov: {} fotiek".format(total))
+    log.info("Pregenerácia thumbnailov: {} fotiek".format(total))
     if _has_state:
         _state.thumb_start(total)
-    done = 0
-    skipped = 0
+    done = 0; skipped = 0
     for src in all_photos:
-        filename = str(src.relative_to(folder))
+        filename  = str(src.relative_to(folder))
         thumb_path = folder / "_thumbs" / filename
         try:
             if thumb_path.exists() and thumb_path.stat().st_mtime >= src.stat().st_mtime:
-                skipped += 1
-                done += 1
-                if _has_state:
-                    _state.thumb_progress(done)
+                skipped += 1; done += 1
+                if _has_state: _state.thumb_progress(done)
                 continue
         except OSError:
             pass
         _get_or_create_thumb(filename)
         done += 1
-        if _has_state:
-            _state.thumb_progress(done)
+        if _has_state: _state.thumb_progress(done)
         if done % 50 == 0:
-            log.info("Thumbnaile: {}/{} ({} preskocených ako hotové)".format(done, total, skipped))
+            log.info("Thumbnaile: {}/{} ({} preskočených)".format(done, total, skipped))
     if _has_state:
         _state.thumb_finish()
-    log.info("Thumbnaile hotové: {}/{} ({} preskocených)".format(done, total, skipped))
+    log.info("Thumbnaile hotové: {}/{} ({} preskočených)".format(done, total, skipped))
 
 
 def run_web_server():
     _load_geocode_cache()
-    log.info("Spústam web server na porte {} (thumb {}px, kvalita {})".format(
-        WEB_PORT, THUMB_MAX_PX, THUMB_QUALITY))
+    log.info("Spúšťam SnapFrame web server – port: {}, jazyk: {}, sleep: {} – {}".format(
+        WEB_PORT, LANGUAGE, SLEEP_START or "off", SLEEP_END or "off"))
     if BASIC_AUTH_USER:
-        log.info("HTTP Basic Auth zapnuta pre uzivatela: {}".format(BASIC_AUTH_USER))
+        log.info("HTTP Basic Auth aktívna pre: {}".format(BASIC_AUTH_USER))
     from waitress import serve
     serve(app, host="0.0.0.0", port=WEB_PORT, threads=8)
 
