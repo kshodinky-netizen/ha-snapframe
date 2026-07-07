@@ -15,12 +15,18 @@ SLIDESHOW_SECONDS=$(bashio::config 'slideshow_seconds')
 WEB_PORT=$(bashio::config 'web_port')
 BASIC_AUTH_USER=$(bashio::config 'basic_auth_user')
 BASIC_AUTH_PASSWORD=$(bashio::config 'basic_auth_password')
+LANGUAGE=$(bashio::config 'language')
+SLEEP_START=$(bashio::config 'sleep_start')
+SLEEP_END=$(bashio::config 'sleep_end')
 
 # bashio vracia "null" pre nové polia ktoré ešte nie sú v options – nahraď defaultmi
 [ "${THUMB_QUALITY}" = "null" ]      && THUMB_QUALITY="82"
 [ "${THUMB_MAX_PX}" = "null" ]       && THUMB_MAX_PX="1024"
 [ "${BASIC_AUTH_USER}" = "null" ]    && BASIC_AUTH_USER=""
 [ "${BASIC_AUTH_PASSWORD}" = "null" ] && BASIC_AUTH_PASSWORD=""
+[ "${LANGUAGE}" = "null" ]            && LANGUAGE="sk"
+[ "${SLEEP_START}" = "null" ]         && SLEEP_START=""
+[ "${SLEEP_END}" = "null" ]           && SLEEP_END=""
 
 bashio::log.info "SMB server: ${SMB_SERVER}"
 bashio::log.info "SMB share: ${SMB_SHARE}"
@@ -74,6 +80,9 @@ export SLIDESHOW_SECONDS
 export WEB_PORT
 export BASIC_AUTH_USER
 export BASIC_AUTH_PASSWORD
+export LANGUAGE
+export SLEEP_START
+export SLEEP_END
 export PYTHONPATH="/usr/bin:${PYTHONPATH:-}"
 
 bashio::log.info "Slideshow interval: ${SLIDESHOW_SECONDS} s"
